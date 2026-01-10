@@ -5,6 +5,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
 
+// 핀 정의
 #define BLUE 6
 #define GREEN 5
 #define RED 7
@@ -20,9 +21,15 @@ SoftwareSerial mySerial(10, 11);
 DFRobotDFPlayerMini myDFPlayer;
 
 bool isPlaying = false;
-bool soundMode = true;
+bool soundMode = true; 
 unsigned long lastTempUpdate = 0;
-const int FSR_THRESHOLD = 200; // 눌렀을 때만 작동하도록 상향 조정
+const int FSR_THRESHOLD = 200; 
+
+// 스위치 디바운싱
+bool lastSwitchState = HIGH;
+bool currentSwitchState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
 
 void setup() {
   pinMode(RED, OUTPUT); pinMode(GREEN, OUTPUT); pinMode(BLUE, OUTPUT);
@@ -33,18 +40,25 @@ void setup() {
   mySerial.begin(9600);
   sensors.begin();
   
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(0,0); lcd.print("Init System...");
+
   if (!myDFPlayer.begin(mySerial)) {
-    Serial.println("DFPlayer Error");
+    Serial.println("DFPlayer Error!");
     while (true); 
   }
   myDFPlayer.volume(25);
-  lcd.init(); lcd.backlight();
+  delay(2000); // 초기화 안정화 대기
+  lcd.clear();
 }
 
-// 각 음성 파일의 길이에 맞춰 대기 시간을 주는 핵심 함수
-void playTrack(int track, unsigned long waitTime) {
-  myDFPlayer.play(track);
-  delay(waitTime); 
+// 강제 재생 함수 (시리얼에 로그 찍음)
+void playHard(int trackNum, unsigned long waitMs) {
+  Serial.print("[명령] 트랙 재생: "); Serial.print(trackNum); 
+  Serial.print("번 (대기: "); Serial.print(waitMs); Serial.println("ms)");
+  
+  myDFPlayer.play(trackNum);
+  delay(waitMs); 
 }
 
 void triggerSoundMode(float temperature) {
@@ -52,76 +66,98 @@ void triggerSoundMode(float temperature) {
   isPlaying = true;
 
   int temp = (int)temperature;
+  Serial.print(">>> 측정된 온도: "); Serial.println(temp);
 
-  // 1. "현재 온도는"
-  playTrack(1, 1600);
+  // 1. "현재 온도는" (0001.mp3)
+  playHard(1, 1600);
 
-  // 2. 온도 숫자 조합 (예: 110도)
-  // 백단위
+  // 2. 숫자 처리
+  // [100의 자리]
   if (temp >= 100) {
-    int hundreds = temp / 100;
-    if (hundreds > 1) playTrack(hundreds + 5, 800); 
-    playTrack(16, 1000); // "백"
+    int h = temp / 100;
+    if (h > 1) playHard(h + 5, 800); // 이백, 삼백...
+    playHard(16, 1000); // "백"
     temp %= 100;
   }
-  
-  // 십단위 (10, 20, 30, 40...)
+
+  // [10의 자리] - 13도일 경우 여기서 10(15번)이 나와야 함
   if (temp >= 10) {
-    int tens = (temp / 10) * 10;
-    if (tens == 10) playTrack(15, 1000);
-    else if (tens == 20) playTrack(18, 1000);
-    else if (tens == 30) playTrack(19, 1000);
-    else if (tens == 40) playTrack(20, 1000);
-    // 50~90 파일은 아직 없으므로 일단 40까지만 구현
-    temp %= 10;
+    int t = (temp / 10) * 10; // 13 -> 10
+    
+    if (t == 90) playHard(25, 1200);
+    else if (t == 80) playHard(24, 1200);
+    else if (t == 70) playHard(23, 1200);
+    else if (t == 60) playHard(22, 1200);
+    else if (t == 50) playHard(21, 1200);
+    else if (t == 40) playHard(20, 1200);
+    else if (t == 30) playHard(19, 1200);
+    else if (t == 20) playHard(18, 1200);
+    else if (t == 10) playHard(15, 1000); // 13도면 여기서 15번(십) 실행
+    
+    temp %= 10; // 13 -> 3 남음
   }
-  
-  // 일단위 (1~9)
+
+  // [1의 자리] - 13도일 경우 여기서 3(8번)이 나와야 함
   if (temp > 0) {
-    playTrack(temp + 5, 900);
+    // 1=6, 2=7, 3=8 ...
+    playHard(temp + 5, 1000); 
   }
 
-  // 3. "도입니다"
-  playTrack(2, 1200);
+  // 3. "도입니다" (0002.mp3)
+  playHard(2, 1300);
 
-  // 4. 상태 조언
-  if (temperature >= 60.0) playTrack(3, 2500);
-  else if (temperature <= 5.0) playTrack(4, 2500);
-  else playTrack(5, 2500);
+  // 4. 조언
+  if (temperature >= 60.0) playHard(3, 3000);
+  else if (temperature <= 5.0) playHard(4, 3000);
+  else playHard(5, 3000);
 
+  Serial.println(">>> 안내 종료");
   isPlaying = false;
 }
 
-void loop() {
-  // 모드 전환
-  if (digitalRead(MODE_SWITCH_PIN) == LOW) {
-    soundMode = !soundMode;
-    delay(500); 
+void checkModeSwitch() {
+  int reading = digitalRead(MODE_SWITCH_PIN);
+  if (reading != lastSwitchState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != currentSwitchState) {
+      currentSwitchState = reading;
+      if (currentSwitchState == LOW) {
+        soundMode = !soundMode;
+        Serial.print("모드 변경: "); Serial.println(soundMode ? "소리" : "진동");
+      }
+    }
   }
+  lastSwitchState = reading;
+}
+
+void updateDisplay(float t) {
+  lcd.setCursor(0,0); lcd.print("Temp: "); lcd.print(t,1); lcd.print((char)223); lcd.print("C   ");
+  lcd.setCursor(0,1); lcd.print(soundMode ? "Mode: SOUND   " : "Mode: VIBE    ");
+  
+  digitalWrite(RED, LOW); digitalWrite(GREEN, LOW); digitalWrite(BLUE, LOW);
+  if (t <= 5.0) digitalWrite(BLUE, HIGH);
+  else if (t >= 60.0) digitalWrite(RED, HIGH);
+  else digitalWrite(GREEN, HIGH);
+}
+
+void loop() {
+  checkModeSwitch();
 
   if (millis() - lastTempUpdate >= 500) {
     sensors.requestTemperatures();
     float currentTemp = sensors.getTempCByIndex(0);
+    
     updateDisplay(currentTemp);
 
-    // FSR 감도 체크 (200 이상일 때만)
-    if (analogRead(FSR_PIN) >= FSR_THRESHOLD) {
+    int fsr = analogRead(FSR_PIN);
+    if (fsr >= FSR_THRESHOLD) {
       if (soundMode) triggerSoundMode(currentTemp);
       else {
-        digitalWrite(VIBRATION_PIN, HIGH);
-        delay(2000);
-        digitalWrite(VIBRATION_PIN, LOW);
+        Serial.println("진동 작동");
+        for(int i=50; i<200; i+=10) { analogWrite(VIBRATION_PIN, i); delay(50); }
+        analogWrite(VIBRATION_PIN, 0);
       }
     }
     lastTempUpdate = millis();
   }
-}
-
-void updateDisplay(float t) {
-  lcd.setCursor(0,0); lcd.print("Temp: "); lcd.print(t,1); lcd.print("C  ");
-  lcd.setCursor(0,1); lcd.print(soundMode ? "Mode: SOUND   " : "Mode: VIBE    ");
-  
-  digitalWrite(RED, t >= 60.0);
-  digitalWrite(BLUE, t <= 5.0);
-  digitalWrite(GREEN, (t > 5.0 && t < 60.0));
 }
